@@ -27,9 +27,11 @@ Item {
   // ---- list state ---------------------------------------------------------
   property var items: []
   property string filter: ""
-  property string vault: "*"
+  property var vault: allVaults
   property bool vaultOpen: false
   property string sortMode: "name"
+  // null cannot collide with a service name, so it is the unfiltered state.
+  readonly property var allVaults: null
   property int selectedIndex: 0
   property bool loading: false
   property bool refreshPending: false
@@ -43,9 +45,7 @@ Item {
   property string pendingDeleteAccount: ""
   property bool deleting: false
 
-  // ---- clipboard clear ----------------------------------------------------
-  property string copiedService: ""
-  property string copiedAccount: ""
+  // ---- clipboard copy -----------------------------------------------------
   property bool pendingCopy: false
   // Identity of the in-flight copy; selection may move before it exits.
   property string copyingService: ""
@@ -57,19 +57,19 @@ Item {
 
   // Vaults: distinct non-empty services with item counts, name-sorted.
   readonly property var vaults: {
-    var counts = {}
+    var counts = new Map()
     for (var i = 0; i < root.items.length; i++) {
       var s = root.items[i].service
-      if (s != null && s !== "") counts[s] = (counts[s] || 0) + 1
+      if (s != null && s !== "") counts.set(s, (counts.get(s) || 0) + 1)
     }
-    return Object.keys(counts).sort().map(function(s) {
-      return { service: s, count: counts[s] }
+    return [...counts.keys()].sort().map(function(s) {
+      return { service: s, count: counts.get(s) }
     })
   }
 
   readonly property var filtered: {
     var list = root.items
-    if (root.vault !== "*")
+    if (root.vault !== allVaults)
       list = list.filter(function(it) { return it.service === root.vault })
     var f = root.filter.toLowerCase()
     if (f !== "")
@@ -82,17 +82,29 @@ Item {
       list = list.slice().sort(function(a, b) {
         return (b.modified || 0) - (a.modified || 0)
       })
+    } else {
+      list = list.slice().sort(function(a, b) {
+        var ka = ((a.service || "") + "" + (a.account || "") + "" + (a.label || ""))
+        var kb = ((b.service || "") + "" + (b.account || "") + "" + (b.label || ""))
+        return ka < kb ? -1 : ka > kb ? 1 : 0
+      })
     }
     return list
   }
 
   function open(payloadJson) {
+    var wasOpen = root.opened
     root.opened = true
+    root.notice = ""
+    root.noticeIsError = false
     refresh()
     // The window maps hidden-then-visible; grab keys once the surface exists.
-    Qt.callLater(function() {
-      if (root.opened) keyCatcher.forceActiveFocus()
-    })
+    // Only on the closed->open transition: a re-summon while a text field owns
+    // focus must not steal it into hotkey dispatch.
+    if (!wasOpen)
+      Qt.callLater(function() {
+        if (root.opened) keyCatcher.forceActiveFocus()
+      })
   }
 
   function close() {
@@ -100,7 +112,7 @@ Item {
     // Wipe anything that could carry a secret or an armed identity.
     root.items = []
     root.filter = ""
-    root.vault = "*"
+    root.vault = allVaults
     root.vaultOpen = false
     root.selectedIndex = 0
     root.adding = false
@@ -108,14 +120,12 @@ Item {
     root.pendingDeleteService = ""
     root.pendingDeleteAccount = ""
     root.deleting = false
-    root.copiedService = ""
-    root.copiedAccount = ""
     root.pendingCopy = false
     root.copyingService = ""
     root.copyingAccount = ""
-    clipTimer.stop()
     root.notice = ""
     root.noticeIsError = false
+    filterField.text = ""
     serviceField.text = ""
     accountField.text = ""
     secretField.text = ""
@@ -151,14 +161,14 @@ Item {
       } catch (e) {}
     }
     root.items = rows
-    if (root.vault !== "*"
+    if (root.vault !== allVaults
         && !rows.some(function(it) { return it.service === root.vault }))
-      root.vault = "*"
+      root.vault = allVaults
     if (root.selectedIndex >= root.filtered.length) root.selectedIndex = Math.max(0, root.filtered.length - 1)
   }
 
   function cycleVault() {
-    var names = ["*"].concat(root.vaults.map(function(v) { return v.service }))
+    var names = [allVaults].concat(root.vaults.map(function(v) { return v.service }))
     var next = (names.indexOf(root.vault) + 1) % names.length
     root.vault = names[next]
     root.selectedIndex = 0
@@ -177,7 +187,7 @@ Item {
   }
 
   function vaultLabel() {
-    if (root.vault === "*") return "All vaults (" + root.items.length + ")"
+    if (root.vault === allVaults) return "All vaults (" + root.items.length + ")"
     var count = 0
     for (var i = 0; i < root.vaults.length; i++)
       if (root.vaults[i].service === root.vault) count = root.vaults[i].count
@@ -204,15 +214,12 @@ Item {
     root.copyingAccount = String(it.account)
     // The value flows through the pipe only: it never lands in a QML
     // property, and --sensitive keeps it out of omarchy clipboard history.
-    copyProc.command = ["sh", "-c", "omarchy-secrets-get \"$1\" \"$2\" | wl-copy --sensitive", "sh",
+    // wl-copy runs only when get succeeds so a lookup failure can neither
+    // clobber the clipboard nor masquerade as a successful copy.
+    copyProc.command = ["bash", "-c",
+      "v=$(omarchy-secrets-get \"$1\" \"$2\") && printf %s \"$v\" | wl-copy --sensitive", "bash",
       root.copyingService, root.copyingAccount]
     copyProc.running = true
-  }
-
-  function armClipClear() {
-    root.copiedService = root.copyingService
-    root.copiedAccount = root.copyingAccount
-    clipTimer.restart()
   }
 
   function requestDeleteSelected() {
@@ -221,6 +228,7 @@ Item {
     root.pendingDeleteService = String(it.service)
     root.pendingDeleteAccount = String(it.account)
     confirmDialog.message = "Delete " + root.pendingDeleteService + " / " + root.pendingDeleteAccount + "?"
+      + (it.app && it.app !== "omarchy" ? " Managed by " + it.app + "." : "")
     confirmDialog.selectedIndex = 0
     confirmDialog.opened = true
     Qt.callLater(function() { confirmDialog.forceActiveFocus() })
@@ -249,81 +257,85 @@ Item {
     if (setProc.running) return
     root.saving = true
     setProc.command = ["omarchy-secrets-set", service, account]
+    // Re-arm stdin per run: a previously finished process kept stdinEnabled
+    // false, which would launch with a closed write channel and starve the
+    // child's stdin read.
+    setProc.stdinEnabled = true
     setProc.running = true
   }
 
   // ---- backend processes --------------------------------------------------
+  // stderr lands in each process's lastStderr and is surfaced only on a
+  // nonzero exit: the backends also use stderr for success diagnostics
+  // ("updated 1 item(s)", duplicate-match warnings), which are not errors.
   Process {
     id: listProc
+    property string lastStderr: ""
     command: ["omarchy-secrets-list"]
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.applyList(text)
+      onStreamFinished: { if (root.opened) root.applyList(text) }
     }
     stderr: StdioCollector {
       waitForEnd: true
-      onStreamFinished: {
-        var err = String(text || "").trim()
-        if (err !== "") root.setNotice(err, true)
-      }
+      onStreamFinished: listProc.lastStderr = String(text || "").trim()
     }
     onExited: function(exitCode) {
       root.loading = false
+      if (!root.opened) { root.refreshPending = false; return }
       if (root.refreshPending) {
         root.refreshPending = false
         Qt.callLater(root.refresh)
         return
       }
-      if (exitCode !== 0 && root.notice === "") root.setNotice("Could not list secrets", true)
+      if (exitCode !== 0 && (root.notice === "" || !root.noticeIsError))
+        root.setNotice(listProc.lastStderr !== "" ? listProc.lastStderr : "Could not list secrets", true)
     }
   }
 
   Process {
     id: copyProc
+    property string lastStderr: ""
     stderr: StdioCollector {
       waitForEnd: true
-      onStreamFinished: {
-        var err = String(text || "").trim()
-        if (err !== "") root.setNotice("Copy failed: " + err, true)
-      }
+      onStreamFinished: copyProc.lastStderr = String(text || "").trim()
     }
     onExited: function(exitCode) {
       if (exitCode === 0) {
-        root.armClipClear()
-        root.setNotice("Copied to clipboard (clears in 30s)", false)
-      } else if (root.notice === "") {
-        root.setNotice("Copy failed", true)
+        // The timed clear must outlive this panel: the dominant flow is
+        // copy-then-dismiss. A detached systemd --on-active timer survives
+        // plugin destruction, and clipclear re-verifies the clipboard still
+        // holds this secret before clearing, so a newer user copy is safe.
+        Util.execArgv(["systemd-run", "--user", "--quiet", "--on-active=30", "--",
+          "omarchy-secrets-clipclear", root.copyingService, root.copyingAccount])
+        if (root.opened) root.setNotice("Copied to clipboard (clears in 30s)", false)
+      } else if (root.opened && (root.notice === "" || !root.noticeIsError)) {
+        root.setNotice(copyProc.lastStderr !== "" ? "Copy failed: " + copyProc.lastStderr : "Copy failed", true)
       }
       if (root.pendingCopy) {
         root.pendingCopy = false
-        Qt.callLater(root.copySelected)
+        if (root.opened) Qt.callLater(root.copySelected)
       }
     }
   }
 
-  // Clears the clipboard 30s after a copy, but only if the user has not
-  // copied something else since: clipclear compares inside the keyring and
-  // never touches the clipboard on a mismatch.
+  // A blocked D-Bus call (locked keyring waiting on an unlock prompt the
+  // exclusive keyboard grab can hide) or a failed process start otherwise
+  // leaves the panel spinning forever; surface it instead of hanging.
   Timer {
-    id: clipTimer
-    interval: 30000
+    id: stallTimer
+    interval: 10000
+    running: root.opened
+      && (listProc.running || copyProc.running || setProc.running || delProc.running)
     onTriggered: {
-      if (root.copiedService === "") return
-      clipProc.command = ["omarchy-secrets-clipclear", root.copiedService, root.copiedAccount]
-      clipProc.running = true
-    }
-  }
-
-  Process {
-    id: clipProc
-    onExited: function(exitCode) {
-      root.copiedService = ""
-      root.copiedAccount = ""
+      if (root.notice === "")
+        root.setNotice("Waiting on the keyring — an unlock prompt may be behind this panel", true)
     }
   }
 
   Process {
     id: setProc
+    property string lastStderr: ""
     stdinEnabled: true
     onStarted: {
       write(secretField.text)
@@ -331,14 +343,12 @@ Item {
     }
     stderr: StdioCollector {
       waitForEnd: true
-      onStreamFinished: {
-        var err = String(text || "").trim()
-        if (err !== "") root.setNotice("Save failed: " + err, true)
-      }
+      onStreamFinished: setProc.lastStderr = String(text || "").trim()
     }
     onExited: function(exitCode) {
       root.saving = false
       secretField.text = ""
+      if (!root.opened) return
       if (exitCode === 0) {
         root.adding = false
         serviceField.text = ""
@@ -347,30 +357,28 @@ Item {
         keyCatcher.forceActiveFocus()
         root.refresh()
       } else if (root.notice === "" || !root.noticeIsError) {
-        root.setNotice("Save failed", true)
+        root.setNotice(setProc.lastStderr !== "" ? "Save failed: " + setProc.lastStderr : "Save failed", true)
       }
     }
   }
 
   Process {
     id: delProc
+    property string lastStderr: ""
     stderr: StdioCollector {
       waitForEnd: true
-      onStreamFinished: {
-        var err = String(text || "").trim()
-        if (err !== "") root.setNotice("Delete failed: " + err, true)
-      }
+      onStreamFinished: delProc.lastStderr = String(text || "").trim()
     }
     onExited: function(exitCode) {
       root.deleting = false
-      var done = exitCode === 0
       root.pendingDeleteService = ""
       root.pendingDeleteAccount = ""
-      if (done) {
+      if (!root.opened) return
+      if (exitCode === 0) {
         root.setNotice("Deleted", false)
         root.refresh()
       } else if (root.notice === "" || !root.noticeIsError) {
-        root.setNotice("Delete failed", true)
+        root.setNotice(delProc.lastStderr !== "" ? "Delete failed: " + delProc.lastStderr : "Delete failed", true)
       }
     }
   }
@@ -400,18 +408,21 @@ Item {
         || secretField.activeFocus || filterField.activeFocus
 
       onMoveRequested: function(dx, dy) {
+        // While the vault picker is open, keys act on it, not the hidden list.
+        if (root.vaultOpen) return
         if (dy === 0 || root.filtered.length === 0) return
         var n = root.filtered.length
         root.selectedIndex = ((root.selectedIndex + dy) % n + n) % n
+        pointerGate.reset()
       }
-      onActivateRequested: root.copySelected()
-      onReturnRequested: root.copySelected()
-      onDeleteRequested: root.requestDeleteSelected()
+      onActivateRequested: { if (!root.vaultOpen) root.copySelected() }
+      onDeleteRequested: { if (!root.vaultOpen) root.requestDeleteSelected() }
       onCloseRequested: {
         if (root.vaultOpen) { root.vaultOpen = false; return }
         root.dismiss()
       }
       onTextKey: function(t) {
+        if (root.vaultOpen) return
         if (t === "/") { filterField.forceActiveFocus(); filterField.selectAll() }
         else if (t === "a") root.startAdd()
         else if (t === "r") root.refresh()
@@ -429,6 +440,13 @@ Item {
           (keyCatcher.height - Style.space(32)) / Math.max(1, height))
 
         MouseArea { anchors.fill: parent; onClicked: {} }
+
+        // Rows sliding under a resting pointer must not steal the j/k
+        // selection; the gate requires real movement first.
+        PointerMoveGate {
+          id: pointerGate
+          referenceItem: card
+        }
 
         BorderSurface {
           id: card
@@ -488,56 +506,57 @@ Item {
             }
 
             // Vault picker overlays the list while open; Escape/v close it.
-            Column {
+            // ListView virtualizes delegates so many vaults scroll instead of
+            // overflowing the card.
+            ListView {
               visible: root.vaultOpen
               Layout.fillWidth: true
+              Layout.preferredHeight: Math.min(contentHeight, Style.space(200))
+              clip: true
               spacing: Style.space(2)
+              model: root.vaultOpen
+                ? [{ service: allVaults, count: root.items.length }].concat(root.vaults)
+                : []
 
-              Repeater {
-                model: root.vaultOpen
-                  ? [{ service: "*", count: root.items.length }].concat(root.vaults)
-                  : []
+              delegate: Item {
+                required property var modelData
+                width: ListView.view ? ListView.view.width : 0
+                height: Style.space(26)
 
-                Item {
-                  required property var modelData
-                  width: parent ? parent.width : 0
-                  height: Style.space(26)
+                Rectangle {
+                  anchors.fill: parent
+                  radius: Style.cornerRadius
+                  color: modelData.service === root.vault
+                    ? Util.alpha(Color.accent, 0.18)
+                    : "transparent"
+                }
 
-                  Rectangle {
-                    anchors.fill: parent
-                    radius: Style.cornerRadius
-                    color: modelData.service === root.vault
-                      ? Util.alpha(Color.accent, 0.18)
-                      : "transparent"
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: modelData.service === allVaults ? "All vaults" : modelData.service
+                    color: Color.foreground
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
                   }
-
-                  RowLayout {
-                    anchors.fill: parent
-                    anchors.leftMargin: Style.space(10)
-                    anchors.rightMargin: Style.space(10)
-                    Text {
-                      Layout.fillWidth: true
-                      textFormat: Text.PlainText
-                      text: modelData.service === "*" ? "All vaults" : modelData.service
-                      color: Color.foreground
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.bodySmall
-                      elide: Text.ElideRight
-                    }
-                    Text {
-                      textFormat: Text.PlainText
-                      text: modelData.count
-                      color: Util.alpha(Color.foreground, 0.45)
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.caption
-                    }
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.count
+                    color: Util.alpha(Color.foreground, 0.45)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
                   }
+                }
 
-                  MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.selectVault(modelData.service)
-                  }
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.selectVault(modelData.service)
                 }
               }
             }
@@ -579,85 +598,87 @@ Item {
                 horizontalAlignment: Text.AlignHCenter
               }
 
-              Flickable {
+              // ListView virtualizes delegates (matters at ~700 items) and
+              // keeps the keyboard selection on screen.
+              ListView {
                 anchors.fill: parent
+                visible: !root.vaultOpen
                 clip: true
-                contentHeight: rowColumn.implicitHeight
+                spacing: Style.space(2)
                 boundsBehavior: Flickable.StopAtBounds
+                model: root.filtered
+                currentIndex: root.selectedIndex
+                onCurrentIndexChanged: {
+                  if (currentIndex >= 0) positionViewAtIndex(currentIndex, ListView.Contain)
+                }
 
-                Column {
-                  id: rowColumn
-                  width: parent.width
-                  spacing: Style.space(2)
+                delegate: Item {
+                  id: row
+                  required property int index
+                  required property var modelData
 
-                  Repeater {
-                    model: root.vaultOpen ? [] : root.filtered
+                  width: ListView.view.width
+                  height: Style.space(34)
 
-                    Item {
-                      required property int index
-                      required property var modelData
+                  readonly property bool isSelected: index === root.selectedIndex
+                  readonly property bool isActionable: root.actionable(modelData)
+                  readonly property bool isExternal: modelData.app !== "omarchy"
 
-                      width: rowColumn.width
-                      height: Style.space(34)
+                  Rectangle {
+                    anchors.fill: parent
+                    radius: Style.cornerRadius
+                    color: isSelected ? Util.alpha(Color.accent, 0.18) : "transparent"
+                  }
 
-                      readonly property bool isSelected: index === root.selectedIndex
-                      readonly property bool isActionable: root.actionable(modelData)
-                      readonly property bool isExternal: modelData.app !== "omarchy"
+                  RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: Style.space(10)
+                    anchors.rightMargin: Style.space(10)
+                    spacing: Style.space(8)
 
-                      Rectangle {
-                        anchors.fill: parent
-                        radius: Style.cornerRadius
-                        color: isSelected ? Util.alpha(Color.accent, 0.18) : "transparent"
-                      }
-
-                      RowLayout {
-                        anchors.fill: parent
-                        anchors.leftMargin: Style.space(10)
-                        anchors.rightMargin: Style.space(10)
-                        spacing: Style.space(8)
-
-                        Text {
-                          Layout.fillWidth: true
-                          textFormat: Text.PlainText
-                          text: isActionable
-                            ? modelData.service + " / " + modelData.account
-                            : (modelData.label || "(unnamed)")
-                          color: isActionable
-                            ? (isSelected ? Color.foreground : Util.alpha(Color.foreground, 0.85))
-                            : Util.alpha(Color.foreground, 0.45)
-                          font.family: Style.font.family
-                          font.pixelSize: Style.font.bodySmall
-                          elide: Text.ElideRight
-                        }
-
-                        Text {
-                          visible: !isActionable || isExternal
-                          textFormat: Text.PlainText
-                          text: isActionable ? "ext" : "other app"
-                          color: Util.alpha(Color.foreground, 0.35)
-                          font.family: Style.font.family
-                          font.pixelSize: Style.font.caption
-                        }
-
-                        Text {
-                          visible: isActionable && isSelected
-                          textFormat: Text.PlainText
-                          text: "copy"
-                          color: Color.accent
-                          font.family: Style.font.family
-                          font.pixelSize: Style.font.caption
-                        }
-                      }
-
-                      MouseArea {
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: isActionable ? Qt.PointingHandCursor : Qt.ArrowCursor
-                        onEntered: root.selectedIndex = index
-                        // copySelected() explains itself for foreign rows.
-                        onClicked: root.copySelected()
-                      }
+                    Text {
+                      Layout.fillWidth: true
+                      textFormat: Text.PlainText
+                      text: isActionable
+                        ? modelData.service + " / " + modelData.account
+                        : (modelData.label || "(unnamed)")
+                      color: isActionable
+                        ? (isSelected ? Color.foreground : Util.alpha(Color.foreground, 0.85))
+                        : Util.alpha(Color.foreground, 0.45)
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.bodySmall
+                      elide: Text.ElideRight
                     }
+
+                    Text {
+                      visible: !isActionable || isExternal
+                      textFormat: Text.PlainText
+                      text: isActionable ? "ext" : "other app"
+                      color: Util.alpha(Color.foreground, 0.35)
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+
+                    Text {
+                      visible: isActionable && isSelected
+                      textFormat: Text.PlainText
+                      text: "copy"
+                      color: Color.accent
+                      font.family: Style.font.family
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: isActionable ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onPositionChanged: function(mouse) {
+                      if (pointerGate.moved(row, mouse)) root.selectedIndex = index
+                    }
+                    // copySelected() explains itself for foreign rows; sync
+                    // selection first so a click acts on the clicked row.
+                    onClicked: { root.selectedIndex = index; root.copySelected() }
                   }
                 }
               }
@@ -752,7 +773,11 @@ Item {
           opened = false
           if (root.pendingDeleteService === "") { keyCatcher.forceActiveFocus(); return }
           root.deleting = true
-          delProc.command = ["omarchy-secrets-delete", root.pendingDeleteService, root.pendingDeleteAccount]
+          // Purge the clipboard first while the keyring copy still exists for
+          // clipclear's compare; then delete every item matching the pair.
+          delProc.command = ["bash", "-c",
+            "omarchy-secrets-clipclear \"$1\" \"$2\" 2>/dev/null || true; exec omarchy-secrets-delete \"$1\" \"$2\"",
+            "bash", root.pendingDeleteService, root.pendingDeleteAccount]
           delProc.running = true
           keyCatcher.forceActiveFocus()
         }
