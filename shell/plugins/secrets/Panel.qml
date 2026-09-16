@@ -744,13 +744,17 @@ Item {
               elide: Text.ElideRight
             }
 
+            // Hints must never paint past the card edge: fillWidth + elide
+            // keeps them inside, and tight `·` separators keep the full
+            // string visible at the normal card width.
             Text {
               Layout.fillWidth: true
               textFormat: Text.PlainText
-              text: "j/k move   enter copy   x delete   / filter   v vault   s sort   a add   r refresh   esc close"
+              text: "j/k move · enter copy · x del · / filter · v vault · s sort · a add · r refresh · esc close"
               color: Util.alpha(Color.foreground, 0.4)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
+              elide: Text.ElideRight
             }
           }
         }
