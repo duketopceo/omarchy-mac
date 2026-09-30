@@ -224,11 +224,21 @@ check("updated value persisted", STORE["items"][0].secret.text == "pw2")
 STORE["items"].append(Item("dup", {"service": "svc", "account": "acct", "app": "ext"}, Value("old", -1, "x")))
 code, _, err = run("set", ["svc", "acct"], "pw3")
 check("set updates every duplicate", code == 0 and "updated 2" in err)
+check("set discloses foreign items", "written by other tools" in err)
 check("duplicates coherent after set", all(i.secret.text == "pw3" for i in STORE["items"]))
+
+# echo-style input: one trailing newline is stripped so the stored value
+# matches what the panel puts on the clipboard
+code, _, _ = run("set", ["svc", "acct"], "pw4\n")
+check("set strips echo trailing newline", code == 0 and all(i.secret.text == "pw4" for i in STORE["items"] if i.attrs.get("service") == "svc"))
+code, _, err = run("set", ["svc", "acct"], "\n")
+check("set rejects newline-only stdin", code != 0 and "empty" in err)
+code, out, _ = run("get", ["svc", "acct"])
+check("get returns the newline-free value", code == 0 and out == "pw4")
 
 # ---- get ------------------------------------------------------------------
 code, out, err = run("get", ["svc", "acct"])
-check("get returns the stored value verbatim", code == 0 and out == "pw3")
+check("get returns the stored value verbatim", code == 0 and out == "pw4")
 check("get warns on duplicate matches", "2 items match" in err)
 code, _, err = run("get", ["svc", "missing"])
 check("get errors on no match", code != 0 and "no secret" in err)
@@ -238,13 +248,13 @@ STORE["items"].append(Item("other", {"service": "b", "account": "c"}, Value("x",
 code, out, _ = run("list", [])
 rows = [json.loads(l) for l in out.strip().splitlines()]
 check("list emits one JSON row per item", code == 0 and len(rows) == 3)
-check("list never prints secret values", "pw3" not in out and '"secret"' not in out)
+check("list never prints secret values", "pw4" not in out and '"secret"' not in out)
 check("list exposes provenance", any(r.get("app") == "omarchy" for r in rows))
 check("list sorts by service/account", [r["service"] for r in rows] == ["b", "svc", "svc"])
 
 # ---- clipclear -------------------------------------------------------------
 with open(__import__("os").environ["CLIP_FILE"], "w") as f:
-    f.write("pw3")
+    f.write("pw4")
 code, _, _ = run("clipclear", ["svc", "acct"])
 with open(__import__("os").environ["CLIP_FILE"]) as f:
     check("clipclear clears a matching clipboard", f.read() == "")
@@ -257,6 +267,16 @@ with open(__import__("os").environ["CLIP_FILE"]) as f:
 
 code, _, err = run("clipclear", ["svc", "missing"])
 check("clipclear errors when the pair is gone", code != 0 and "no secret" in err)
+
+# legacy entry: stored value still has the newline `set` now strips; the
+# clipboard does not — the clear must still match
+STORE["items"].append(Item("legacy", {"service": "old", "account": "a"}, Value("oldtok\n", -1, "x")))
+with open(__import__("os").environ["CLIP_FILE"], "w") as f:
+    f.write("oldtok")
+code, _, _ = run("clipclear", ["old", "a"])
+with open(__import__("os").environ["CLIP_FILE"]) as f:
+    check("clipclear clears a legacy newline-suffixed secret", f.read() == "")
+del STORE["items"][-1]
 
 # ---- delete ----------------------------------------------------------------
 code, _, err = run("delete", ["svc", "acct"])
