@@ -35,6 +35,9 @@ Item {
   property int selectedIndex: 0
   property bool loading: false
   property bool refreshPending: false
+  // A locked collection lists as empty and refuses writes; it must surface as
+  // its own state, not "No secrets stored".
+  property bool locked: false
 
   // ---- add form -----------------------------------------------------------
   property bool adding: false
@@ -123,6 +126,7 @@ Item {
     root.pendingCopy = false
     root.copyingService = ""
     root.copyingAccount = ""
+    root.locked = false
     root.notice = ""
     root.noticeIsError = false
     filterField.text = ""
@@ -143,10 +147,22 @@ Item {
     root.noticeIsError = isError
   }
 
+  // Lock state gates the list: omarchy-secrets-list carries UNLOCK, which can
+  // spawn a prompter that this Overlay-layer, exclusive-grab window would
+  // cover and starve of keys. Probe first; only list when unlocked.
   function refresh() {
-    if (listProc.running) { root.refreshPending = true; return }
+    if (statusProc.running || listProc.running) { root.refreshPending = true; return }
     root.loading = true
-    listProc.running = true
+    statusProc.running = true
+  }
+
+  function requestUnlock() {
+    // The prompter needs the screen and the keyboard: this window is Overlay
+    // + exclusive grab, so it would hide the dialog and eat its input.
+    // Detach the call, then get out of the way; the next summon sees an
+    // unlocked keyring.
+    Util.execArgv(["omarchy-secrets-unlock"])
+    root.dismiss()
   }
 
   function applyList(raw) {
@@ -235,6 +251,7 @@ Item {
   }
 
   function startAdd() {
+    if (root.locked) { setNotice("Keyring locked — press u to unlock", true); return }
     root.adding = true
     setNotice("", false)
     Qt.callLater(function() { serviceField.forceActiveFocus() })
@@ -268,6 +285,39 @@ Item {
   // stderr lands in each process's lastStderr and is surfaced only on a
   // nonzero exit: the backends also use stderr for success diagnostics
   // ("updated 1 item(s)", duplicate-match warnings), which are not errors.
+  Process {
+    id: statusProc
+    property string lastStderr: ""
+    command: ["omarchy-secrets-status"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        try { root.locked = !!JSON.parse(text).locked }
+        catch (e) { root.locked = false }
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: statusProc.lastStderr = String(text || "").trim()
+    }
+    onExited: function(exitCode) {
+      if (!root.opened) { root.refreshPending = false; return }
+      if (root.refreshPending) {
+        root.refreshPending = false
+        Qt.callLater(root.refresh)
+        return
+      }
+      if (exitCode !== 0) {
+        root.loading = false
+        root.setNotice(statusProc.lastStderr !== "" ? statusProc.lastStderr : "Could not read keyring state", true)
+        return
+      }
+      if (root.locked) { root.items = []; root.loading = false; return }
+      if (listProc.running) { root.refreshPending = true; return }
+      listProc.running = true
+    }
+  }
+
   Process {
     id: listProc
     property string lastStderr: ""
@@ -425,6 +475,7 @@ Item {
         if (root.vaultOpen) return
         if (t === "/") { filterField.forceActiveFocus(); filterField.selectAll() }
         else if (t === "a") root.startAdd()
+        else if (t === "u") { if (root.locked) root.requestUnlock() }
         else if (t === "r") root.refresh()
         else if (t === "v") root.cycleVault()
         else if (t === "s") root.cycleSort()
@@ -585,17 +636,30 @@ Item {
               Layout.fillHeight: true
 
               // Empty states share one slot; the list sits on top.
-              Text {
+              Column {
                 anchors.centerIn: parent
-                textFormat: Text.PlainText
+                spacing: Style.space(8)
                 visible: !root.loading && root.filtered.length === 0
-                text: root.items.length === 0
-                  ? (root.notice !== "" && root.noticeIsError ? "" : "No secrets stored")
-                  : "No matches"
-                color: Util.alpha(Color.foreground, 0.55)
-                font.family: Style.font.family
-                font.pixelSize: Style.font.bodySmall
-                horizontalAlignment: Text.AlignHCenter
+
+                Text {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  textFormat: Text.PlainText
+                  text: root.locked
+                    ? "Keyring locked"
+                    : (root.items.length === 0
+                        ? (root.notice !== "" && root.noticeIsError ? "" : "No secrets stored")
+                        : "No matches")
+                  color: Util.alpha(Color.foreground, 0.55)
+                  font.family: Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                Button {
+                  anchors.horizontalCenter: parent.horizontalCenter
+                  visible: root.locked
+                  text: "Unlock  (u)"
+                  onClicked: root.requestUnlock()
+                }
               }
 
               // ListView virtualizes delegates (matters at ~700 items) and

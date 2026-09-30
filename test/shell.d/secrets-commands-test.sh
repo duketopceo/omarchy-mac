@@ -107,7 +107,16 @@ class Item:
         STORE["items"].remove(self)
 
 
-STORE = {"items": []}
+STORE = {"items": [], "locked": True}
+
+
+class Collection:
+    @classmethod
+    def for_alias_sync(cls, svc, alias, flags, cancellable):
+        return cls()
+
+    def get_locked(self):
+        return STORE["locked"]
 
 
 class Service:
@@ -125,6 +134,11 @@ class Service:
             if i.attrs.get("service") == attrs.get("service")
             and i.attrs.get("account") == attrs.get("account")
         ]
+
+    @classmethod
+    def unlock_sync(cls, svc, objects, cancellable):
+        STORE["locked"] = False
+        return (list(objects), [])
 
 
 def password_store_sync(schema, attrs, collection, label, secret, cancellable):
@@ -146,7 +160,9 @@ Secret.SchemaFlags = types.SimpleNamespace(NONE=0, DONT_MATCH_NAME=1)
 Secret.SchemaAttributeType = types.SimpleNamespace(STRING=0)
 Secret.SearchFlags = types.SimpleNamespace(ALL=1, UNLOCK=2, LOAD_SECRETS=4)
 Secret.ServiceFlags = types.SimpleNamespace(NONE=0)
+Secret.CollectionFlags = types.SimpleNamespace(NONE=0)
 Secret.Service = Service
+Secret.Collection = Collection
 Secret.Value = Value
 Secret.COLLECTION_DEFAULT = "default"
 Secret.password_store_sync = password_store_sync
@@ -284,6 +300,16 @@ check("delete removes every duplicate", code == 0 and "deleted 2" in err)
 check("namespace clean after delete", all(i.attrs.get("service") != "svc" for i in STORE["items"]))
 code, _, err = run("delete", ["svc", "acct"])
 check("delete errors when nothing remains", code != 0 and "no secret" in err)
+
+# ---- status / unlock --------------------------------------------------------
+code, out, _ = run("status", [])
+check("status reports locked state", code == 0 and json.loads(out)["locked"] is True)
+code, _, err = run("unlock", [])
+check("unlock opens the collection", code == 0 and STORE["locked"] is False)
+code, out, _ = run("status", [])
+check("status reports unlocked", code == 0 and json.loads(out)["locked"] is False)
+code, _, _ = run("unlock", [])
+check("unlock is a no-op success when already unlocked", code == 0)
 
 sys.exit(1 if failures else 0)
 PY

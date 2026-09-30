@@ -76,7 +76,7 @@ assert(/ConfirmDialog[\s\S]*confirmText: "Delete"/.test(panelSource), 'deletion 
 assert(/Managed by " \+ it\.app/.test(panelSource), 'delete discloses foreign ownership')
 assert(/function close\(\)[\s\S]*secretField\.text = ""/.test(panelSource), 'close() wipes secret-bearing fields')
 assert(/if \(copyProc\.running\) \{ root\.pendingCopy = true; return \}/.test(panelSource), 'copy coalesces while one is in flight')
-assert(/if \(listProc\.running\) \{ root\.refreshPending = true; return \}/.test(panelSource), 'refresh queues behind a running list')
+assert(/if \(statusProc\.running \|\| listProc\.running\) \{ root\.refreshPending = true; return \}/.test(panelSource), 'refresh queues behind a running status or list')
 assert(/if \(!it \|\| !actionable\(it\) \|\| root\.deleting\) return/.test(panelSource), 'delete is guarded')
 assert(/onClicked: \{ root\.selectedIndex = index; root\.copySelected\(\) \}/.test(panelSource),
   'click copies the clicked row, not the keyboard selection')
@@ -85,4 +85,20 @@ assert(/id: stallTimer[\s\S]*"Waiting on the keyring/.test(panelSource),
 assert(/property string lastStderr/.test(panelSource) && /lastStderr !== "" \?/.test(panelSource),
   'stderr surfaces only on nonzero exit, not on success diagnostics')
 assert(/if \(!root\.opened\) return/.test(panelSource), 'in-flight process exits cannot repopulate a closed panel')
+
+// Locked state: probed via omarchy-secrets-status before the list call, so a
+// locked collection cannot masquerade as an empty vault — and the unlock
+// affordance detaches + dismisses because this Overlay-layer exclusive-grab
+// window would cover the prompter and eat its keyboard input.
+assert(/command: \["omarchy-secrets-status"\]/.test(panelSource), 'lock state probed via omarchy-secrets-status')
+assert(/if \(root\.locked\) \{ root\.items = \[\]; root\.loading = false; return \}/.test(panelSource),
+  'locked state short-circuits before the list call')
+assert(/text: root\.locked\s*\n[\s\S]*"Keyring locked"/.test(panelSource), 'locked keyring is its own empty state')
+assert(/Util\.execArgv\(\["omarchy-secrets-unlock"\]\)[\s\S]*root\.dismiss\(\)/.test(panelSource),
+  'unlock detaches and dismisses so the prompter gets the screen')
+assert(/t === "u"\) \{ if \(root\.locked\) root\.requestUnlock\(\) \}/.test(panelSource),
+  'u key unlocks only in the locked state')
+assert(/if \(root\.locked\) \{ setNotice\("Keyring locked/.test(panelSource),
+  'add is refused while locked instead of spawning a hidden prompt')
+assert(/root\.locked = false/.test(panelSource), 'close() clears the locked state')
 JS
